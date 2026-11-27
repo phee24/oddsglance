@@ -1,6 +1,8 @@
 node_modules/
 dist/
 *.ehpk
+tools/telegram-alerts/config.json
+tools/telegram-alerts/state.json
 .env
 .env.*
 !.env.example

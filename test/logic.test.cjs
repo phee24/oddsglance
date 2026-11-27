@@ -3,7 +3,8 @@
 // client cache/stale behavior, paper-trade math, settlement, persistence.
 const assert = require('node:assert')
 const { GammaClient, parseMarket } = require('/tmp/og-test/gamma.js')
-const { PaperStore, MemoryBackend, positionValue, positionPnl, STARTING_CASH } = require('/tmp/og-test/state.js')
+const { PaperStore, MemoryBackend, WatchlistStore, MAX_FOLLOWED, positionValue, positionPnl, STARTING_CASH } = require('/tmp/og-test/state.js')
+const { computeAlerts, alertBanner, ALERT_THRESHOLD_PTS } = require('/tmp/og-test/alerts.js')
 const { fmtPct, fmtMoney, fmtSignedMoney, truncateWords } = require('/tmp/og-test/format.js')
 
 let passed = 0
@@ -103,6 +104,70 @@ async function main() {
   const store3 = new PaperStore(backend)
   await store3.init()
   ok('reset persists', store3.cash === STARTING_CASH && store3.positions.length === 0)
+
+  console.log('[GammaClient paging]')
+  const page1 = {
+    markets: [keysetRaw, { ...keysetRaw, id: '555', question: 'Third?', outcomePrices: ['0.2', '0.8'] }],
+    next_cursor: 'CUR1',
+  }
+  const page2 = {
+    markets: [{ ...keysetRaw, id: '666', question: 'Fourth?', outcomePrices: ['0.7', '0.3'] }],
+    next_cursor: null,
+  }
+  const pagingFetch = async (url) => ({
+    ok: true, status: 200,
+    json: async () => (String(url).includes('after_cursor=CUR1') ? page2 : page1),
+  })
+  const pagingClient = new GammaClient(pagingFetch)
+  const firstPage = await pagingClient.fetchTopMarkets(2)
+  ok('first page returns cursor', firstPage.markets.length === 2 && firstPage.nextCursor === 'CUR1')
+  const nextPage = await pagingClient.fetchNextMarkets(firstPage.nextCursor, 1)
+  ok('next page follows cursor', nextPage.markets.length === 1 && nextPage.markets[0].id === '666' && nextPage.nextCursor === null)
+  const noCursor = await pagingClient.fetchNextMarkets(null, 8)
+  ok('null cursor -> empty page, no fetch', noCursor.markets.length === 0 && noCursor.nextCursor === null)
+
+  console.log('[WatchlistStore]')
+  const wlBackend = new MemoryBackend()
+  const wl = new WatchlistStore(wlBackend)
+  await wl.init()
+  ok('watchlist starts empty', wl.list.length === 0 && !wl.has('111'))
+  ok('add follows', (await wl.add(m1)) === true && wl.has('111') && wl.list.length === 1)
+  ok('re-add same market rejected', (await wl.add(m1)) === false && wl.list.length === 1)
+  ok('remove unfollows', (await wl.remove('111')) === true && !wl.has('111'))
+  ok('remove unknown rejected', (await wl.remove('111')) === false)
+  await wl.add(m1)
+  const wl2 = new WatchlistStore(wlBackend)
+  await wl2.init()
+  ok('watchlist survives reload', wl2.has('111') && wl2.list[0].question === m1.question)
+  const badBackend = new MemoryBackend()
+  await badBackend.save('[{"id":123}]')
+  const wlBad = new WatchlistStore(badBackend)
+  await wlBad.init()
+  ok('corrupt watchlist -> empty, no crash', wlBad.list.length === 0)
+  const fullBackend = new MemoryBackend()
+  const wlFull = new WatchlistStore(fullBackend)
+  await wlFull.init()
+  for (let i = 0; i < MAX_FOLLOWED; i++) {
+    await wlFull.add({ ...m1, id: `f${i}` })
+  }
+  ok('watchlist caps at MAX_FOLLOWED', wlFull.list.length === MAX_FOLLOWED && (await wlFull.add({ ...m1, id: 'overflow' })) === false)
+
+  console.log('[computeAlerts]')
+  const alertStore = new PaperStore(new MemoryBackend())
+  await alertStore.init()
+  const alertPos = await alertStore.placeBet(m1, 0, 25) // entry 0.62
+  const noMove = computeAlerts(alertStore.positions, () => 0.65)
+  ok('3 pts move -> no alert', noMove.length === 0)
+  const bigMove = computeAlerts(alertStore.positions, () => 0.75)
+  ok('13 pts move -> alert up', bigMove.length === 1 && bigMove[0].direction === 'up' && bigMove[0].movePts === 13)
+  const bigDrop = computeAlerts(alertStore.positions, () => 0.50)
+  ok('12 pts drop -> alert down', bigDrop.length === 1 && bigDrop[0].direction === 'down' && bigDrop[0].movePts === -12)
+  const exact = computeAlerts(alertStore.positions, () => 0.72)
+  ok('exactly threshold fires', exact.length === 1)
+  const noPrice = computeAlerts(alertStore.positions, () => undefined)
+  ok('no live price -> no alert', noPrice.length === 0)
+  ok('alertBanner formats', alertBanner(bigMove[0]).includes('⚠ ALERT') && alertBanner(bigMove[0]).includes('+13 pts'))
+  ok('threshold constant is 10 pts', ALERT_THRESHOLD_PTS === 10)
 
   console.log('[LIVE Gamma]')
   const live = new GammaClient()

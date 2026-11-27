@@ -12,16 +12,20 @@ import {
 } from '@evenrealities/even_hub_sdk'
 import { GammaClient, type Market } from './gamma'
 import {
+  MAX_FOLLOWED,
   MemoryBackend,
   PaperStore,
   STAKE_PRESETS,
   STORAGE_KEY,
+  WATCHLIST_KEY,
+  WatchlistStore,
   type Position,
   type StorageBackend,
 } from './state'
+import { ALERT_THRESHOLD_PTS, alertBanner, computeAlerts, type Alert } from './alerts'
 import { fmtMoney, fmtPct, fmtSignedMoney } from './format'
 import { fullText } from './screens/common'
-import { buildMarketsEmptyPage, buildMarketsPage, portfolioIndex } from './screens/markets'
+import { buildMarketsEmptyPage, buildMarketsPage, resolveMarketsRow, type MarketsView } from './screens/markets'
 import { buildDetailPage, DetailAction } from './screens/detail'
 import {
   backIndex,
@@ -37,20 +41,23 @@ type Screen = 'markets' | 'detail' | 'portfolio'
 const REFRESH_MS = 60_000
 const STORAGE_PROBE_MS = 1_200
 
-/** Bridge-backed storage; falls back to session memory when unreachable. */
+/** Bridge-backed storage for one key; falls back to session memory when unreachable. */
 class BridgeBackend implements StorageBackend {
-  constructor(private readonly bridge: EvenAppBridge) {}
+  constructor(
+    private readonly bridge: EvenAppBridge,
+    private readonly key: string,
+  ) {}
   async load(): Promise<string | null> {
-    const v = await this.bridge.getLocalStorage(STORAGE_KEY)
+    const v = await this.bridge.getLocalStorage(this.key)
     return v ? v : null
   }
   async save(value: string): Promise<void> {
-    await this.bridge.setLocalStorage(STORAGE_KEY, value)
+    await this.bridge.setLocalStorage(this.key, value)
   }
 }
 
-async function pickBackend(bridge: EvenAppBridge): Promise<StorageBackend> {
-  const backend = new BridgeBackend(bridge)
+async function pickBackend(bridge: EvenAppBridge, key: string): Promise<StorageBackend> {
+  const backend = new BridgeBackend(bridge, key)
   try {
     const probe = backend.load()
     const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), STORAGE_PROBE_MS))
@@ -73,10 +80,14 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
 class App {
   private readonly gamma = new GammaClient()
   private readonly store: PaperStore
+  private readonly watchlist: WatchlistStore
   private screen: Screen = 'markets'
   private markets: Market[] = []
   private marketsStale = false
   private marketsLoaded = false
+  private marketsCursor: string | null = null
+  private shownCount = 8
+  private activeAlerts: Alert[] = []
   private readonly marketById = new Map<string, Market>()
   private detail: { market: Market; side: 0 | 1; stakeIndex: number; status: string } | null = null
   private portfolioStatus = ''
@@ -85,12 +96,18 @@ class App {
   private timer: ReturnType<typeof setInterval> | null = null
   private unsubscribe: (() => void) | null = null
 
-  constructor(private readonly bridge: EvenAppBridge, backend: StorageBackend) {
+  constructor(
+    private readonly bridge: EvenAppBridge,
+    backend: StorageBackend,
+    watchlistBackend: StorageBackend,
+  ) {
     this.store = new PaperStore(backend)
+    this.watchlist = new WatchlistStore(watchlistBackend)
   }
 
   async start(): Promise<void> {
     await this.store.init()
+    await this.watchlist.init()
     const result = await this.bridge.createStartUpPageContainer(
       new CreateStartUpPageContainer({
         containerTotalNum: 1,
@@ -108,11 +125,54 @@ class App {
 
   // ---------- data ----------
 
+  /** Markets currently shown on screen 1 (followed ones excluded). */
+  private shownMarkets(): Market[] {
+    const followedIds = new Set(this.watchlist.list.map(e => e.id))
+    return this.markets.filter(m => !followedIds.has(m.id)).slice(0, this.shownCount)
+  }
+
+  /** Followed markets with the freshest price we have for each. */
+  private followedMarkets(): Market[] {
+    const out: Market[] = []
+    for (const entry of this.watchlist.list) {
+      const live = this.marketById.get(entry.id)
+      out.push(
+        live ?? {
+          id: entry.id,
+          question: entry.question,
+          outcomes: [entry.outcomes[0], entry.outcomes[1]],
+          prices: [0.5, 0.5],
+          volume24hr: 0,
+          endDate: null,
+          closed: false,
+          active: true,
+        },
+      )
+    }
+    return out
+  }
+
+  private marketsView(): MarketsView {
+    return {
+      followed: this.followedMarkets(),
+      markets: this.shownMarkets(),
+      hasMore: this.shownCount < this.markets.length || this.marketsCursor !== null,
+      stale: this.marketsStale,
+      alertCount: this.activeAlerts.length,
+    }
+  }
+
+  /** Recompute big-move alerts from current prices. */
+  private evaluateAlerts(): void {
+    this.activeAlerts = computeAlerts(this.store.positions, pos => this.priceOf(pos), ALERT_THRESHOLD_PTS)
+  }
+
   private async refreshMarkets(): Promise<void> {
-    const { markets, stale } = await this.gamma.fetchTopMarkets(8)
+    const { markets, stale, nextCursor } = await this.gamma.fetchTopMarkets(24)
     if (markets.length > 0) {
       this.markets = markets
       this.marketsLoaded = true
+      this.marketsCursor = nextCursor
       for (const m of markets) this.marketById.set(m.id, m)
       // Keep an open Detail screen marked to the freshest prices.
       if (this.detail) {
@@ -121,8 +181,46 @@ class App {
       }
     }
     this.marketsStale = stale
+    // Followed markets are refreshed by id so a market far down the volume
+    // ranking still shows live odds — that is the point of following it.
+    await this.refreshFollowed()
+    this.evaluateAlerts()
     if (this.screen === 'markets') await this.render()
     else if (this.screen === 'detail') await this.render()
+  }
+
+  private async refreshFollowed(): Promise<void> {
+    const entries = this.watchlist.list
+    if (entries.length === 0) return
+    const fetched = await Promise.all(entries.map(e => this.gamma.fetchMarketById(e.id)))
+    for (const market of fetched) {
+      if (market) this.marketById.set(market.id, market)
+    }
+  }
+
+  /** Load the next volume page behind "More markets". */
+  private async loadMoreMarkets(): Promise<void> {
+    if (this.shownCount < this.markets.length) {
+      this.shownCount += 8
+      await this.render()
+      return
+    }
+    if (!this.marketsCursor) return
+    const { markets, stale, nextCursor } = await this.gamma.fetchNextMarkets(this.marketsCursor, 24)
+    if (markets.length > 0) {
+      const seen = new Set(this.markets.map(m => m.id))
+      for (const m of markets) {
+        if (!seen.has(m.id)) {
+          seen.add(m.id)
+          this.markets.push(m)
+          this.marketById.set(m.id, m)
+        }
+      }
+      this.marketsCursor = nextCursor
+      this.shownCount += 8
+    }
+    this.marketsStale = stale
+    await this.render()
   }
 
   private async refreshPortfolioData(): Promise<void> {
@@ -150,6 +248,7 @@ class App {
     } else {
       this.portfolioStale = false
     }
+    this.evaluateAlerts()
   }
 
   private async periodicRefresh(): Promise<void> {
@@ -185,6 +284,7 @@ class App {
       totalPnl: this.store.totalPnl(pos => this.priceOf(pos)),
       positions,
       status: this.portfolioStatus,
+      alertText: this.activeAlerts.length > 0 ? alertBanner(this.activeAlerts[0]) : '',
       stale: this.portfolioStale,
     }
   }
@@ -193,7 +293,7 @@ class App {
     try {
       if (this.screen === 'markets') {
         const page = this.marketsLoaded || this.markets.length > 0
-          ? buildMarketsPage(this.markets, this.marketsStale)
+          ? buildMarketsPage(this.marketsView())
           : buildMarketsEmptyPage()
         await this.bridge.rebuildPageContainer(page)
       } else if (this.screen === 'detail' && this.detail) {
@@ -202,6 +302,7 @@ class App {
             market: this.detail.market,
             side: this.detail.side,
             stakeIndex: this.detail.stakeIndex,
+            followed: this.watchlist.has(this.detail.market.id),
             status: this.detail.status,
           }),
         )
@@ -269,12 +370,17 @@ class App {
       else if (index === 1) await this.goPortfolio()
       return
     }
-    if (index === portfolioIndex(this.markets)) {
+    const row = resolveMarketsRow(index, this.marketsView())
+    if (!row) return
+    if (row.kind === 'portfolio') {
       await this.goPortfolio()
       return
     }
-    const market = this.markets[index]
-    if (!market) return
+    if (row.kind === 'more') {
+      await this.loadMoreMarkets()
+      return
+    }
+    const market = row.market
     const lead = market.prices[0] >= market.prices[1] ? 0 : 1
     this.detail = { market, side: lead as 0 | 1, stakeIndex: 1, status: '' }
     this.screen = 'detail'
@@ -292,6 +398,19 @@ class App {
     }
     if (index === DetailAction.Stake) {
       d.stakeIndex = (d.stakeIndex + 1) % STAKE_PRESETS.length
+      await this.render()
+      return
+    }
+    if (index === DetailAction.Follow) {
+      if (this.watchlist.has(d.market.id)) {
+        await this.watchlist.remove(d.market.id)
+        d.status = 'Unfollowed — no longer pinned on Markets'
+      } else {
+        const added = await this.watchlist.add(d.market)
+        d.status = added
+          ? '★ Following — pinned on Markets, live odds'
+          : `Watchlist full (max ${MAX_FOLLOWED}) — unfollow one first`
+      }
       await this.render()
       return
     }
@@ -349,6 +468,7 @@ class App {
 }
 
 const bridge = await waitForEvenAppBridge()
-const backend = await pickBackend(bridge)
-const app = new App(bridge, backend)
+const backend = await pickBackend(bridge, STORAGE_KEY)
+const watchlistBackend = await pickBackend(bridge, WATCHLIST_KEY)
+const app = new App(bridge, backend, watchlistBackend)
 await app.start()

@@ -29,6 +29,8 @@ export interface PortfolioView {
   positions: PositionView[]
   /** e.g. "Cashed out YES: +$27.50" or "Settled: NO +$25.00". */
   status: string
+  /** Big-move banner, e.g. "⚠ ALERT: YES Fed cut ▲ +12 pts". Empty when none. */
+  alertText: string
   stale: boolean
 }
 
@@ -61,6 +63,7 @@ export function buildPortfolioPage(view: PortfolioView): RebuildPageContainer {
     `PORTFOLIO (PAPER)${view.stale ? ' (STALE)' : ''}`,
     `Equity ${fmtMoney(view.equity)} · Cash ${fmtMoney(view.cash)} · PnL ${fmtSignedMoney(view.totalPnl)}`,
   ]
+  if (view.alertText) lines.push(view.alertText)
   if (view.status) lines.push(view.status)
   lines.push('Paper trading demo — not financial advice.')
 

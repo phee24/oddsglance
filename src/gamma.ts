@@ -128,6 +128,8 @@ export interface TopMarketsResult {
   markets: Market[]
   /** True when this is last-good cached data because the live fetch failed. */
   stale: boolean
+  /** Keyset cursor to continue paging after the last page fetched. */
+  nextCursor: string | null
 }
 
 export class GammaClient {
@@ -143,36 +145,78 @@ export class GammaClient {
    * UI needs so non-binary/malformed entries can be filtered without
    * starving the list; follows one keyset cursor if the first page filters
    * down too far. On network failure returns the last-good cache (stale).
+   * `nextCursor` continues the volume ranking where this call stopped, so
+   * the UI can page beyond the first screen ("More markets").
    */
   async fetchTopMarkets(limit = 8): Promise<TopMarketsResult> {
-    const pageSize = Math.max(limit * 3, 24)
-    const base =
-      `${GAMMA_BASE}/markets/keyset?active=true&closed=false` +
-      `&order=volume24hr&ascending=false&limit=${pageSize}`
+    const base = this.keysetBase(Math.max(limit * 3, 24))
     try {
-      const found: Market[] = []
-      const seen = new Set<string>()
-      let url: string | null = base
-      for (let page = 0; page < 2 && url; page++) {
-        const payload: unknown = await fetchJson(url, this.fetchImpl)
-        const { raws, nextCursor } = keysetMarkets(payload)
-        for (const raw of raws) {
-          const market = parseMarket(raw)
-          if (market && !seen.has(market.id)) {
-            seen.add(market.id)
-            found.push(market)
-          }
-        }
-        if (found.length >= limit || !nextCursor) break
-        url = `${base}&after_cursor=${encodeURIComponent(nextCursor)}`
-      }
+      const { found, nextCursor } = await this.collectMarkets(base, null, limit, 2)
       const markets = found.slice(0, limit)
       if (markets.length > 0) this.lastGood = markets
-      return { markets, stale: false }
+      return { markets, stale: false, nextCursor }
     } catch {
-      if (this.lastGood.length > 0) return { markets: this.lastGood, stale: true }
-      return { markets: [], stale: true }
+      if (this.lastGood.length > 0) return { markets: this.lastGood, stale: true, nextCursor: null }
+      return { markets: [], stale: true, nextCursor: null }
     }
+  }
+
+  /**
+   * Next page of the volume ranking after `afterCursor` (from a previous
+   * `fetchTopMarkets` / `fetchNextMarkets` result). Returns up to `limit`
+   * further binary markets plus the cursor for the page after that. Null
+   * cursor input means "no further page" — returns an empty page.
+   */
+  async fetchNextMarkets(afterCursor: string | null, limit = 8): Promise<TopMarketsResult> {
+    if (!afterCursor) return { markets: [], stale: false, nextCursor: null }
+    const base = this.keysetBase(Math.max(limit * 3, 24))
+    try {
+      const { found, nextCursor } = await this.collectMarkets(base, afterCursor, limit, 2)
+      return { markets: found.slice(0, limit), stale: false, nextCursor }
+    } catch {
+      return { markets: [], stale: true, nextCursor: afterCursor }
+    }
+  }
+
+  private keysetBase(pageSize: number): string {
+    return (
+      `${GAMMA_BASE}/markets/keyset?active=true&closed=false` +
+      `&order=volume24hr&ascending=false&limit=${pageSize}`
+    )
+  }
+
+  /**
+   * Walk up to `maxPages` keyset pages starting at `firstCursor` (null =
+   * first page), collecting binary markets. Every page URL is built from
+   * the cursor-free base + the current cursor, so no duplicate
+   * `after_cursor` params are ever sent.
+   */
+  private async collectMarkets(
+    baseUrl: string,
+    firstCursor: string | null,
+    limit: number,
+    maxPages: number,
+  ): Promise<{ found: Market[]; nextCursor: string | null }> {
+    const found: Market[] = []
+    const seen = new Set<string>()
+    let cursor: string | null = firstCursor
+    let nextCursor: string | null = null
+    for (let page = 0; page < maxPages; page++) {
+      const url = cursor ? `${baseUrl}&after_cursor=${encodeURIComponent(cursor)}` : baseUrl
+      const payload: unknown = await fetchJson(url, this.fetchImpl)
+      const { raws, nextCursor: pageCursor } = keysetMarkets(payload)
+      nextCursor = pageCursor
+      for (const raw of raws) {
+        const market = parseMarket(raw)
+        if (market && !seen.has(market.id)) {
+          seen.add(market.id)
+          found.push(market)
+        }
+      }
+      if (found.length >= limit || !nextCursor) break
+      cursor = nextCursor
+    }
+    return { found, nextCursor }
   }
 
   /**

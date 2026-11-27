@@ -227,3 +227,109 @@ export class PaperStore {
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Watchlist — markets the user follows, beyond the top-8 volume list.
+// A followed market stays pinned at the top of the Markets screen with live
+// prices, however far down the volume ranking it sits. Stored separately
+// from the portfolio so following never touches paper funds.
+// ---------------------------------------------------------------------------
+
+export const WATCHLIST_KEY = 'oddsglance.watchlist.v1'
+export const MAX_FOLLOWED = 20
+
+export interface WatchlistEntry {
+  id: string
+  question: string
+  outcomes: [string, string]
+  addedAt: number
+}
+
+function sanitizeWatchlist(raw: unknown): WatchlistEntry[] | null {
+  if (!Array.isArray(raw)) return null
+  const entries: WatchlistEntry[] = []
+  for (const item of raw) {
+    if (typeof item !== 'object' || item === null) return null
+    const e = item as Record<string, unknown>
+    const outcomes = e.outcomes
+    const valid =
+      typeof e.id === 'string' &&
+      e.id.length > 0 &&
+      typeof e.question === 'string' &&
+      e.question.length > 0 &&
+      Array.isArray(outcomes) &&
+      outcomes.length === 2 &&
+      typeof outcomes[0] === 'string' &&
+      typeof outcomes[1] === 'string' &&
+      typeof e.addedAt === 'number'
+    if (!valid) return null
+    entries.push(item as unknown as WatchlistEntry)
+  }
+  return entries
+}
+
+export class WatchlistStore {
+  private entries: WatchlistEntry[] = []
+
+  constructor(private readonly backend: StorageBackend) {}
+
+  /** Load persisted follows; falls back to an empty watchlist. */
+  async init(): Promise<void> {
+    try {
+      const raw = await this.backend.load()
+      if (raw) {
+        const parsed = sanitizeWatchlist(JSON.parse(raw) as unknown)
+        if (parsed) {
+          this.entries = parsed.slice(0, MAX_FOLLOWED)
+          return
+        }
+      }
+    } catch {
+      // Corrupt or unavailable storage -> empty watchlist, never crash.
+    }
+    this.entries = []
+  }
+
+  get list(): readonly WatchlistEntry[] {
+    return this.entries
+  }
+
+  has(id: string): boolean {
+    return this.entries.some(e => e.id === id)
+  }
+
+  /**
+   * Follow a market. Returns false when already followed or the watchlist
+   * is full (MAX_FOLLOWED) — the UI then says so instead of failing
+   * silently.
+   */
+  async add(market: Market): Promise<boolean> {
+    if (this.has(market.id)) return false
+    if (this.entries.length >= MAX_FOLLOWED) return false
+    this.entries.push({
+      id: market.id,
+      question: market.question,
+      outcomes: [market.outcomes[0], market.outcomes[1]],
+      addedAt: Date.now(),
+    })
+    await this.persist()
+    return true
+  }
+
+  /** Unfollow a market. Returns false when it was not followed. */
+  async remove(id: string): Promise<boolean> {
+    const before = this.entries.length
+    this.entries = this.entries.filter(e => e.id !== id)
+    if (this.entries.length === before) return false
+    await this.persist()
+    return true
+  }
+
+  private async persist(): Promise<void> {
+    try {
+      await this.backend.save(JSON.stringify(this.entries))
+    } catch {
+      // Best-effort; in-memory list stays authoritative for this session.
+    }
+  }
+}

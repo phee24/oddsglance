@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "pack": "npm run build && evenhub pack app.json dist",
     "simulate": "evenhub-simulator http://localhost:5173",
-    "test:logic": "tsc src/format.ts src/gamma.ts src/state.ts --outDir /tmp/og-test --module commonjs --moduleResolution node --target es2022 --lib es2022,dom --strict --skipLibCheck && node test/logic.test.cjs"
+    "test:logic": "tsc src/format.ts src/gamma.ts src/state.ts src/alerts.ts --outDir /tmp/og-test --module commonjs --moduleResolution node --target es2022 --lib es2022,dom --strict --skipLibCheck && node test/logic.test.cjs"
   },
   "dependencies": {
     "@evenrealities/even_hub_sdk": "^0.0.10"

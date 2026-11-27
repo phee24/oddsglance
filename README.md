@@ -16,6 +16,8 @@ Checking prediction-market odds means pulling out your phone and opening a dense
 ## Features
 
 - **Live markets, at a glance** — the 8 hottest active binary markets on Polymarket, ranked by 24h volume, each shown as question + leading outcome + live odds %. Data refreshes on open and every 60 seconds while the app runs.
+- **Watchlist — follow any market** — tap "☆ Follow this market" on any Detail screen and that market pins to the top of the Markets screen with a ★ and live odds, however far down the volume ranking it sits. "More markets ↓" pages past the first 8 (8 → 16 → 24 …) via Gamma keyset cursors, so you can find and follow a market you care about instead of only the hottest ones. Up to 20 follows, stored on-device.
+- **Big-move alerts** — a position whose price moves ≥ 10 points from entry raises a `⚠ ALERT` banner on the Portfolio screen and an alert count in the Markets header. The glasses app cannot push anything while closed, so the same 10-point rule also runs as a **Telegram alerts relay** (`tools/telegram-alerts/`, zero-dependency Node): it polls Gamma and sends one Telegram message per big move, even while the app is shut. See `tools/telegram-alerts/README.md` for the 5-minute setup.
 - **Market detail** — full question, both outcomes with live odds, 24h volume, and end date.
 - **Paper bet in one tap** — tap to pick a side, scroll to pick a stake ($10 / $25 / $50 / $100 paper), one tap to place. Positions are stored on-device.
 - **Paper portfolio with live PnL** — equity, cash, and total PnL; each position marked to live odds (entry vs. now). Tap a position to cash out at current odds. Resolved markets settle automatically at the final price.
@@ -34,9 +36,12 @@ Polymarket Gamma API (public, keyless, read-only)
         │
         ▼
 OddsGlance (Vite + TypeScript + @evenrealities/even_hub_sdk)
-  Screen 1  Markets    — ListContainer: 8 markets + odds %
-  Screen 2  Detail     — both outcomes, volume, paper-bet flow
-  Screen 3  Portfolio  — positions, live PnL, cash out
+  Screen 1  Markets    — ListContainer: ★ followed + 8 markets + odds %
+              (+ "More markets" paging, alert count in header)
+  Screen 2  Detail     — both outcomes, volume, paper-bet flow, Follow
+  Screen 3  Portfolio  — positions, live PnL, cash out, alert banner
+  Relay     Telegram alerts (tools/telegram-alerts/) — same 10-pt rule,
+              polls Gamma, pings your phone while the app is closed
         │
         ▼
 Even G2 lens (576×288) — scroll to choose, tap to act
@@ -45,7 +50,7 @@ Even G2 lens (576×288) — scroll to choose, tap to act
 - The app fetches market data directly from `gamma-api.polymarket.com` (whitelisted in `app.json`; the API returns `Access-Control-Allow-Origin: *`, so no proxy or backend is needed). It uses the **`/markets/keyset`** endpoint family — the classic `/markets` endpoints are deprecated (sunset May 1, 2026) and are not used anywhere.
 - The Gamma API is quirky: `outcomes`/`outcomePrices` may arrive as native arrays (keyset) or as JSON strings inside JSON (classic). The parser accepts both, and only markets with exactly 2 outcomes and valid prices (0 < p < 1) are shown.
 - Paper-trading math: buying a position gives `shares = stake / entryPrice`; current value is `shares × currentPrice`; PnL is `value − stake`. Cashing out credits the current value to paper cash. A market that closes settles at its final price (0 or 1).
-- Paper balance and positions persist on-device between sessions via the Even bridge storage API (`setLocalStorage` / `getLocalStorage`, key `oddsglance.portfolio.v1`), with an in-memory fallback for local browser testing. Persistence was verified in the simulator within a session.
+- Paper balance and positions persist on-device between sessions via the Even bridge storage API (`setLocalStorage` / `getLocalStorage`, keys `oddsglance.portfolio.v1` and `oddsglance.watchlist.v1`), with an in-memory fallback for local browser testing. Persistence was verified in the simulator within a session (bet placed → cash $975 shown; follow → ★ pinned). **Simulator limit, verified 27 Nov 2026:** after a *full simulator process restart*, portfolio and watchlist both reset to fresh ($1,000, no follows) — the simulator's bridge storage is session-scoped. On real G2 hardware `setLocalStorage` is the official persistent API, so device verification is still open (Demo Day QA item).
 
 ## Run it (simulator — no glasses needed)
 
@@ -66,7 +71,7 @@ Other scripts:
 
 ```bash
 npm run build        # type-check (tsc strict) + production build to dist/
-npm run test:logic   # 33-assertion logic test suite (parsing, paper math, live API)
+npm run test:logic   # 51-assertion logic test suite (parsing, paging, watchlist, alerts, paper math, live API)
 npm run pack         # build + `evenhub pack app.json dist` → .ehpk package
 ```
 
@@ -79,17 +84,22 @@ package.json        Scripts: dev / build / pack / simulate / test:logic
 public/icon.png     Greyscale app icon
 src/
   main.ts           Bootstrap (waitForEvenAppBridge), screen router, event handling
-  gamma.ts          Polymarket Gamma API client (/markets/keyset): fetch, parse, normalize, last-good cache
-  state.ts          Paper portfolio store (balance, positions) + bridge-storage persistence
+  gamma.ts          Polymarket Gamma API client (/markets/keyset): fetch, parse, normalize, last-good cache, cursor paging
+  state.ts          Paper portfolio store (balance, positions) + watchlist store + bridge-storage persistence
+  alerts.ts         Big-move alert rule (≥ 10 pts from entry), shared by the app and the Telegram relay
   format.ts         Odds %, currency, date, and text-truncation formatting
   screens/
     common.ts       Shared screen helpers
-    markets.ts      Screen 1: market list
-    detail.ts       Screen 2: market detail + paper-bet flow
-    portfolio.ts    Screen 3: positions, PnL, cash out
+    markets.ts      Screen 1: ★ followed + market list + "More markets"
+    detail.ts       Screen 2: market detail + paper-bet flow + Follow
+    portfolio.ts    Screen 3: positions, PnL, cash out, alert banner
+tools/
+  telegram-alerts/  Telegram relay: polls Gamma, sends one message per big move
+                    (notify.mjs, config.example.json, README.md)
+PITCH.md            Demo Day pitch notes — answers to the organizer's 4 feedback points
 test/
-  logic.test.cjs    Logic test suite (33 assertions, incl. live Gamma checks)
-qa-screenshots/     Simulator QA captures (markets, detail, bet placed, portfolio)
+  logic.test.cjs    Logic test suite (51 assertions, incl. live Gamma checks)
+qa-screenshots/     Simulator QA captures (markets, detail, bet placed, portfolio, watchlist, more-markets, post-restart)
 oddsglance.ehpk     Packaged build (evenhub pack)
 ```
 
